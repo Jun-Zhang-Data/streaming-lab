@@ -1,0 +1,5 @@
+﻿$ErrorActionPreference = "Stop"
+$env:HADOOP_HOME="C:\hadoop"
+$env:hadoop_home_dir="C:\hadoop"
+$env:PATH="C:\hadoop\bin;$env:PATH"
+Write-Host "HADOOP_HOME=$env:HADOOP_HOME"

@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "clicks-value",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "user_id", "page", "country", "event_ts"],
+  "properties": {
+    "event_id": { "type": "string" },
+    "user_id": { "type": "integer" },
+    "page": { "type": "string" },
+    "country": { "type": "string", "minLength": 2, "maxLength": 2 },
+    "event_ts": { "type": "string" }
+  }
+}
