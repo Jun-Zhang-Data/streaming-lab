@@ -478,3 +478,300 @@ python -m src.jobs.gold_agg
 Write-Host "✅ Repo structure created. Try: dir .\scripts"
 # ====== END ======
 -----------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+1) What this project is (the big picture)
+
+You built a local streaming lakehouse:
+
+Producer → Kafka (Redpanda) → Spark streaming → Delta Lake (Bronze/Silver/Gold + DLQ)
+
+Producer: generates click events continuously (JSON)
+
+Kafka / Redpanda: holds events in a topic (clicks)
+
+Spark Structured Streaming: reads events continuously and transforms them
+
+Delta Lake (ACID tables on disk): stores outputs in transaction-safe tables
+
+Bronze/Silver/Gold: “layers” that mirror real company pipelines
+
+DLQ: “dead letter queue” table where bad records go
+
+You can run it without cloud. Everything is local.
+
+2) The data that flows through the system
+
+Each event looks like this (JSON):
+
+{
+  "event_id": "uuid",
+  "user_id": 64,
+  "page": "/docs",
+  "country": "FI",
+  "event_ts": "2026-01-09T12:37:29.749115+00:00"
+}
+
+
+Important fields:
+
+event_id: unique id (used for dedupe)
+
+event_ts: event time from the source (used for event-time windows)
+
+user_id, page, country: dimensions for analytics
+
+3) Repo layout (what each folder is for)
+Root
+
+docker-compose.yml — starts Redpanda + Kafka UI
+
+requirements.txt — Python deps (pyspark + delta-spark + confluent-kafka)
+
+README.md — runbook
+
+src/
+
+All Python code.
+
+src/producer.py
+
+Produces events into Kafka topic clicks
+
+src/common/
+
+Shared utilities:
+
+settings.py
+
+defines constants like Kafka bootstrap server and output paths:
+
+out/bronze/..., out/silver/..., out/gold/...
+
+checkpoints under out/_checkpoints/...
+
+schemas.py
+
+defines expected JSON schema for parsing click events
+
+spark.py
+
+creates Spark session correctly for Windows + Delta + Kafka
+
+includes fixes you needed:
+
+Delta enabled
+
+Kafka connector jars added
+
+Python executable forced (avoid “python3 not found”)
+
+append_progress_loop() logs streaming progress to logs/
+
+src/jobs/
+
+Streaming jobs:
+
+bronze_ingest.py
+
+silver_clean.py
+
+gold_agg.py
+
+out/
+
+Where Delta tables + checkpoints live (DO NOT commit to GitHub)
+
+logs/
+
+Runtime logs + progress logs (also do not commit)
+
+scripts/
+
+PowerShell helpers (up, down, run_*, start_all, stop_all)
+
+4) What each pipeline stage does
+4.1 Bronze — src/jobs/bronze_ingest.py
+
+Purpose: store raw ingestion “as received” (audit layer)
+
+Reads from Kafka topic clicks and writes to Delta table:
+
+out/bronze/clicks_parquet (name kept from earlier, but it’s Delta)
+
+It stores:
+
+raw_json (original event string)
+
+Kafka metadata: topic, partition, offset, kafka_timestamp
+
+ingest_ts (processing time when Bronze saw it)
+
+parsed fields (best-effort): event_id, user_id, page, country, event_ts
+
+Why Bronze matters in real work:
+
+you can replay / rebuild downstream
+
+you can audit exactly what came from source + offsets
+
+4.2 Silver — src/jobs/silver_clean.py
+
+Purpose: clean, validate, dedupe, standardize
+
+Reads Bronze Delta and:
+
+parses event_ts into event_time (Timestamp)
+
+validates required fields:
+
+event_id, event_time, country, page, user_id
+
+splits data:
+
+valid rows → Silver
+
+invalid rows → DLQ
+
+dedupes valid events using:
+
+withWatermark("event_time", "10 minutes")
+
+dropDuplicates(["event_id"])
+
+Writes:
+
+Silver: out/silver/clicks_clean (Delta)
+
+DLQ: out/dlq/clicks_dlq (Delta)
+
+Why dedupe + watermark matters:
+
+streaming pipelines can see duplicates (retries/replays)
+
+watermark limits how long Spark keeps state
+
+4.3 Gold — src/jobs/gold_agg.py
+
+Purpose: business KPIs
+
+Reads Silver and computes:
+
+events per country per 1-minute window
+
+Key output columns:
+
+window_start, window_end, country, events
+
+Writes to:
+
+out/gold/kpi_country_minute (Delta)
+
+Important detail: Delta streaming sink doesn’t support outputMode("update") directly.
+So Gold uses foreachBatch + MERGE:
+
+each microbatch produces updated counts
+
+MERGE upserts into Delta table keyed by (window_start, window_end, country)
+
+result: the table always reflects latest counts, like a dashboard table
+
+5) Checkpoints (why you have _checkpoints)
+
+Each job has its own checkpoint folder under:
+
+out/_checkpoints/<layer>/<table>
+
+This stores:
+
+which offsets/files were processed
+
+state for dedupe / windowing
+
+Why checkpoints matter:
+
+if you stop and restart a job, it continues from where it left off
+
+deleting checkpoints forces a “reprocess”
+
+6) How to run it
+Option A: multiple terminals (simplest conceptually)
+
+.\scripts\up.ps1
+
+.\scripts\run_producer.ps1
+
+.\scripts\run_bronze.ps1
+
+.\scripts\run_silver.ps1
+
+.\scripts\run_gold.ps1
+
+Stop each with Ctrl+C.
+
+Option B: one terminal (recommended for you)
+
+Start all:
+
+.\scripts\start_all.ps1
+
+
+Stop all:
+
+.\scripts\stop_all.ps1
+
+
+Logs:
+
+logs/gold.out.log, logs/gold.err.log, etc.
+
+7) How to verify it’s working (most important)
+7.1 Delta tables exist
+
+A Delta table must have _delta_log:
+
+Test-Path .\out\bronze\clicks_parquet\_delta_log
+Test-Path .\out\silver\clicks_clean\_delta_log
+Test-Path .\out\gold\kpi_country_minute\_delta_log
+Test-Path .\out\dlq\clicks_dlq\_delta_log
+
+7.2 Query results (Gold KPI)
+python -c "from src.common.spark import build_spark; from src.common.settings import GOLD_COUNTRY_MINUTE_PATH; s=build_spark('peek-gold'); df=s.read.format('delta').load(str(GOLD_COUNTRY_MINUTE_PATH)); print('count=', df.count()); df.orderBy('window_start', ascending=False).show(50, truncate=False); s.stop()"
+
+
+If count > 0, you’re good.
+
+7.3 Check DLQ
+python -c "from src.common.spark import build_spark; from src.common.settings import DLQ_PATH; s=build_spark('peek-dlq'); df=s.read.format('delta').load(str(DLQ_PATH)); print('count=', df.count()); df.orderBy('ingest_ts', ascending=False).show(20, truncate=False); s.stop()"
+
+8) Common “noise” you can ignore
+
+Spark UI port warnings (4040/4041/4042)
+
+“Failed to delete Spark temp dir / snappy jar” (Windows file locking)
+
+They do not mean the pipeline is wrong.
+
+9) What a real data engineer would do next (your roadmap)
+
+Runbook & replay
+
+scripts to rebuild Silver+Gold from Bronze
+
+scripts to replay from Kafka earliest (wipe Bronze checkpoint)
+
+Data quality metrics
+
+a gold table: invalid_rate per minute, total_events per minute
+
+Schema contract
+
+store JSON schema/Avro for events
+
+(optional) register in Schema Registry
+
+More realistic source
+
+a second topic (purchases) + join → “conversion rate” KPI
