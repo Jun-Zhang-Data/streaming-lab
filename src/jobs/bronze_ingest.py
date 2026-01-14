@@ -1,65 +1,82 @@
-﻿from pyspark.sql.functions import col, from_json, current_timestamp
+﻿from __future__ import annotations
 
-from src.common.spark import build_spark, append_progress_loop
-from src.common.schemas import CLICK_EVENT_SCHEMA
+from pyspark.sql.functions import col, current_timestamp, from_json
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+
 from src.common.settings import (
-    KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC_CLICKS, KAFKA_STARTING_OFFSETS,
-    BRONZE_PATH, BRONZE_CKPT, LOGS
+    BRONZE_CKPT,
+    BRONZE_CLICKS_PATH,
+    KAFKA_BOOTSTRAP,
+    KAFKA_TOPIC_CLICKS,
+    LOGS_DIR,
+    MAX_OFFSETS_PER_TRIGGER,
+    STARTING_OFFSETS,
+    TRIGGER_SECONDS,
 )
+from src.common.spark import build_spark, append_progress_loop
 
-def main():
-    spark = build_spark("bronze_ingest_clicks")
+
+EVENT_SCHEMA = StructType([
+    StructField("event_id", StringType(), True),
+    StructField("user_id", LongType(), True),
+    StructField("page", StringType(), True),
+    StructField("country", StringType(), True),
+    StructField("event_ts", StringType(), True),
+])
+
+
+def main() -> None:
+    spark = build_spark("bronze-ingest")
 
     kafka_df = (
         spark.readStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("subscribe", KAFKA_TOPIC_CLICKS)
-        .option("startingOffsets", KAFKA_STARTING_OFFSETS)
+        .option("startingOffsets", STARTING_OFFSETS)
+        .option("maxOffsetsPerTrigger", MAX_OFFSETS_PER_TRIGGER)
+        .option("failOnDataLoss", "false")
         .load()
     )
 
-    bronze = (
-        kafka_df.selectExpr(
-            "CAST(key AS STRING) AS kafka_key",
-            "CAST(value AS STRING) AS raw_json",
-            "topic", "partition", "offset", "timestamp AS kafka_timestamp"
-        )
-        .withColumn("ingest_ts", current_timestamp())
-        .withColumn("e", from_json(col("raw_json"), CLICK_EVENT_SCHEMA))
-        .select(
-            "raw_json",
-            "kafka_key",
-            "topic", "partition", "offset", "kafka_timestamp",
-            "ingest_ts",
-            col("e.event_id").alias("event_id"),
-            col("e.user_id").alias("user_id"),
-            col("e.page").alias("page"),
-            col("e.country").alias("country"),
-            col("e.event_ts").alias("event_ts"),
-        )
-    )
+    # Kafka 'value' is bytes; cast to string = raw JSON
+    raw = kafka_df.select(
+        col("topic"),
+        col("partition"),
+        col("offset"),
+        col("timestamp").alias("kafka_timestamp"),
+        col("key").cast("string").alias("kafka_key"),
+        col("value").cast("string").alias("raw_json"),
+    ).withColumn("ingest_ts", current_timestamp())
 
-    q = (
-        bronze.writeStream
+    parsed = raw.withColumn("j", from_json(col("raw_json"), EVENT_SCHEMA)).select(
+        "*",
+        col("j.event_id").alias("event_id"),
+        col("j.user_id").alias("user_id"),
+        col("j.page").alias("page"),
+        col("j.country").alias("country"),
+        col("j.event_ts").alias("event_ts"),
+    ).drop("j")
+
+    query = (
+        parsed.writeStream
         .format("delta")
-        .option("path", str(BRONZE_PATH))
-        .option("checkpointLocation", str(BRONZE_CKPT))
         .outputMode("append")
-        .start()
+        .option("checkpointLocation", str(BRONZE_CKPT))
+        .trigger(processingTime=f"{TRIGGER_SECONDS} seconds")
+        .start(str(BRONZE_CLICKS_PATH))
     )
 
-    print("✅ BRONZE started (Delta)")
-    print("Path:", BRONZE_PATH)
-
+    # progress log
     try:
-        append_progress_loop(q, LOGS / "bronze_progress.jsonl", every_seconds=10)
-        q.awaitTermination()
+        append_progress_loop(query, LOGS_DIR / "bronze_progress.jsonl", every_seconds=10)
     except KeyboardInterrupt:
-        print("\nStopping BRONZE...")
+        print("\nStopping...")
     finally:
-        q.stop()
+        query.stop()
         spark.stop()
+
 
 if __name__ == "__main__":
     main()
+

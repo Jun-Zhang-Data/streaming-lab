@@ -1,38 +1,40 @@
 ﻿from __future__ import annotations
-import os
+
 from pathlib import Path
 
-def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+# Repo root (src/common/settings.py -> parents[2] == repo root)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-ROOT = project_root()
+OUT_DIR = PROJECT_ROOT / "out"
+LOGS_DIR = PROJECT_ROOT / "logs"
 
-# Kafka
-KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_TOPIC_CLICKS = os.environ.get("KAFKA_TOPIC_CLICKS", "clicks")
-KAFKA_STARTING_OFFSETS = os.environ.get("KAFKA_STARTING_OFFSETS", "latest")  # latest|earliest|json
+# --- Kafka ---
+KAFKA_BOOTSTRAP = "localhost:9092"
+KAFKA_TOPIC_CLICKS = "clicks"
 
-# Spark / Scala (match your working setup)
-SPARK_VERSION = os.environ.get("SPARK_VERSION", "3.5.5")
-SCALA_BINARY_VERSION = os.environ.get("SCALA_BINARY_VERSION", "2.12")
+# --- Delta table paths ---
+BRONZE_CLICKS_PATH = OUT_DIR / "bronze" / "clicks_parquet"
+SILVER_CLICKS_PATH = OUT_DIR / "silver" / "clicks_clean"
+DLQ_CLICKS_PATH = OUT_DIR / "dlq" / "clicks_dlq"
+GOLD_COUNTRY_MINUTE_PATH = OUT_DIR / "gold" / "kpi_country_minute"
 
-SPARK_KAFKA_PACKAGES = ",".join([
-    f"org.apache.spark:spark-sql-kafka-0-10_{SCALA_BINARY_VERSION}:{SPARK_VERSION}",
-    f"org.apache.spark:spark-token-provider-kafka-0-10_{SCALA_BINARY_VERSION}:{SPARK_VERSION}",
-])
+# --- Checkpoints ---
+CHK_DIR = OUT_DIR / "_checkpoints"
+BRONZE_CKPT = CHK_DIR / "bronze_clicks"
+SILVER_CKPT = CHK_DIR / "silver_clicks"
+GOLD_CKPT = CHK_DIR / "gold_country_minute"
 
-# Output locations
-OUT = ROOT / "out"
-LOGS = ROOT / "logs"
+# --- Audit (optional but very useful) ---
+AUDIT_PATH = OUT_DIR / "audit" / "stream_audit"
 
-BRONZE_PATH = OUT / "bronze" / "clicks_parquet"
-SILVER_PATH = OUT / "silver" / "clicks_clean"
-GOLD_COUNTRY_MINUTE_PATH = OUT / "gold" / "kpi_country_minute"
-DLQ_PATH = OUT / "dlq" / "clicks_dlq"
+# --- Streaming knobs (safe beginner defaults) ---
+TRIGGER_SECONDS = 10                 # micro-batch interval
+MAX_OFFSETS_PER_TRIGGER = 5000       # rate limit from Kafka
+STARTING_OFFSETS = "latest"          # "earliest" for backfill/testing
 
-CKPT = OUT / "_checkpoints"
-BRONZE_CKPT = CKPT / "bronze" / "clicks_parquet"
-SILVER_CKPT = CKPT / "silver" / "clicks_clean"
-GOLD_COUNTRY_MINUTE_CKPT = CKPT / "gold" / "kpi_country_minute"
-DLQ_CKPT = CKPT / "dlq" / "clicks_dlq"
+# --- Watermarks (tune later) ---
+SILVER_WATERMARK = "10 minutes"      # dedup state window
+GOLD_WATERMARK = "10 minutes"        # aggregation lateness window
 
+# Partitioning column name
+PARTITION_COL = "event_date"

@@ -1,49 +1,53 @@
-import argparse
+from __future__ import annotations
+
 import json
+import random
 import time
 import uuid
 from datetime import datetime, timezone
-from random import choice, randint
 
-from confluent_kafka import Producer
+from kafka import KafkaProducer
 
-BOOTSTRAP = "localhost:9092"
-TOPIC = "clicks"
+from src.common.settings import KAFKA_BOOTSTRAP, KAFKA_TOPIC_CLICKS
 
-p = Producer({"bootstrap.servers": BOOTSTRAP})
 
-pages = ["/", "/pricing", "/signup", "/docs", "/blog", "/account"]
-countries = ["SE", "NO", "DK", "FI", "DE", "NL"]
+PAGES = ["/", "/docs", "/pricing", "/login", "/settings", "/search"]
+COUNTRIES = ["SE", "NO", "FI", "DK", "DE", "NL", "US"]
 
-def delivery_report(err, msg):
-    if err is not None:
-        print("Delivery failed:", err)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--seconds", type=int, default=0, help="Run for N seconds (0=forever)")
-    args = ap.parse_args()
+def iso_utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    start = time.time()
 
-    while True:
-        if args.seconds and (time.time() - start) >= args.seconds:
-            break
+def main() -> None:
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        acks="all",
+        retries=5,
+        linger_ms=10,
+    )
 
-        event = {
-            "event_id": str(uuid.uuid4()),
-            "user_id": randint(1, 200),
-            "page": choice(pages),
-            "country": choice(countries),
-            "event_ts": datetime.now(timezone.utc).isoformat(),
-        }
+    print("Producer connected:", KAFKA_BOOTSTRAP, "topic:", KAFKA_TOPIC_CLICKS)
 
-        key = str(event["user_id"]).encode("utf-8")
-        value = json.dumps(event).encode("utf-8")
+    try:
+        while True:
+            event = {
+                "event_id": str(uuid.uuid4()),
+                "user_id": random.randint(1, 2000),
+                "page": random.choice(PAGES),
+                "country": random.choice(COUNTRIES),
+                "event_ts": iso_utc_now(),
+            }
+            producer.send(KAFKA_TOPIC_CLICKS, value=event)
+            # small sleep to avoid overwhelming local machine
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("\nStopping producer...")
+    finally:
+        producer.flush(5)
+        producer.close(5)
 
-        p.produce(TOPIC, key=key, value=value, callback=delivery_report)
-        p.poll(0)
-        time.sleep(0.2)
 
 if __name__ == "__main__":
     main()

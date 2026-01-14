@@ -1,65 +1,88 @@
-﻿# src/jobs/gold_agg.py
+﻿from __future__ import annotations
+
+from typing import Optional
+
 from delta.tables import DeltaTable
-from pyspark.sql.functions import col, window
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, to_date, window
 
-from src.common.spark import build_spark, append_progress_loop
+from src.common.audit import write_audit
 from src.common.settings import (
-    SILVER_PATH,
+    AUDIT_PATH,
+    GOLD_CKPT,
     GOLD_COUNTRY_MINUTE_PATH,
-    GOLD_COUNTRY_MINUTE_CKPT,
-    LOGS,
+    GOLD_WATERMARK,
+    LOGS_DIR,
+    SILVER_CLICKS_PATH,
+    TRIGGER_SECONDS,
 )
-
-KEY_COND = """
-t.window_start = s.window_start AND
-t.window_end   = s.window_end   AND
-t.country      = s.country
-"""
+from src.common.spark import build_spark, append_progress_loop
 
 
-def upsert_kpi(microbatch_df, batch_id: int):
+def upsert_gold_batch(spark, batch_df: DataFrame, batch_id: int) -> None:
     """
-    microbatch_df contains updates for aggregations (because we run outputMode('update')).
-    We upsert into a Delta table so the table always reflects the latest counts.
+    MERGE this micro-batch of aggregates into the Gold Delta table.
+    Key: (window_start, window_end, country)
     """
-    spark = microbatch_df.sparkSession
-    path = str(GOLD_COUNTRY_MINUTE_PATH)
-
-    # If batch is empty, do nothing
-    if microbatch_df.rdd.isEmpty():
+    if batch_df is None:
+        return
+    if batch_df.rdd.isEmpty():
+        # Optional audit
+        try:
+            write_audit(spark, str(AUDIT_PATH), "gold_country_minute", batch_id, 0, 0, note="empty_batch")
+        except Exception:
+            pass
         return
 
-    # Create table if missing
-    if not DeltaTable.isDeltaTable(spark, path):
-        (microbatch_df
-         .write
+    gold_path = str(GOLD_COUNTRY_MINUTE_PATH)
+
+    # Create table on first write
+    if not DeltaTable.isDeltaTable(spark, gold_path):
+        (batch_df.write
          .format("delta")
          .mode("overwrite")
-         .save(path))
+         .save(gold_path))
+        try:
+            write_audit(spark, str(AUDIT_PATH), "gold_country_minute", batch_id,
+                        rows_in=batch_df.count(), rows_out=batch_df.count(), note="create_table_overwrite")
+        except Exception:
+            pass
         return
 
-    tgt = DeltaTable.forPath(spark, path)
+    tgt = DeltaTable.forPath(spark, gold_path)
 
-    (tgt.alias("t")
-        .merge(microbatch_df.alias("s"), KEY_COND)
+    (
+        tgt.alias("t")
+        .merge(
+            batch_df.alias("s"),
+            "t.window_start = s.window_start AND "
+            "t.window_end = s.window_end AND "
+            "t.country = s.country"
+        )
         .whenMatchedUpdateAll()
         .whenNotMatchedInsertAll()
-        .execute())
+        .execute()
+    )
+
+    try:
+        n = batch_df.count()
+        write_audit(spark, str(AUDIT_PATH), "gold_country_minute", batch_id, n, n, note="merge_upsert")
+    except Exception:
+        pass
 
 
-def main():
-    spark = build_spark("gold_agg_clicks")
+def main() -> None:
+    spark = build_spark("gold-agg")
 
     silver = (
         spark.readStream
         .format("delta")
-        .load(str(SILVER_PATH))
+        .load(str(SILVER_CLICKS_PATH))
     )
 
     agg = (
         silver
-        # Make results appear sooner (still handles late data)
-        .withWatermark("event_time", "1 minute")
+        .withWatermark("event_time", GOLD_WATERMARK)
         .groupBy(window(col("event_time"), "1 minute"), col("country"))
         .count()
         .select(
@@ -68,25 +91,23 @@ def main():
             col("country"),
             col("count").alias("events"),
         )
+        .withColumn("event_date", to_date(col("window_start")))
     )
 
-    q = (
+    query = (
         agg.writeStream
-        .foreachBatch(upsert_kpi)
-        .option("checkpointLocation", str(GOLD_COUNTRY_MINUTE_CKPT))
-        .outputMode("update")  # allowed with foreachBatch
+        .foreachBatch(lambda df, bid: upsert_gold_batch(spark, df, bid))
+        .option("checkpointLocation", str(GOLD_CKPT))
+        .trigger(processingTime=f"{TRIGGER_SECONDS} seconds")
         .start()
     )
 
-    print("GOLD started (Delta via foreachBatch MERGE)")
-
     try:
-        append_progress_loop(q, LOGS / "gold_progress.jsonl", every_seconds=10)
-        q.awaitTermination()
+        append_progress_loop(query, LOGS_DIR / "gold_progress.jsonl", every_seconds=10)
     except KeyboardInterrupt:
-        print("\nStopping GOLD...")
+        print("\nStopping...")
     finally:
-        q.stop()
+        query.stop()
         spark.stop()
 
 
